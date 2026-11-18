@@ -191,6 +191,14 @@ func (s *XiaohongshuService) waitScanInBackground(
 		defer s.logins.finish(seq)
 
 		if loginAction.WaitForLogin(ctxTimeout) {
+			// 先在同一浏览器里建立创作者中心会话，再保存 cookies；
+			// 否则后续发布的新浏览器可能反复要求登录创作者中心。
+			if err := loginAction.WarmUpCreatorSession(ctxTimeout); err != nil {
+				logrus.Warnf("建立创作者中心会话失败，cookies 仍会保存，会话 #%d: %v", seq, err)
+			} else {
+				logrus.Infof("创作者中心会话已建立，会话 #%d", seq)
+			}
+
 			if err := saveCookies(page); err != nil {
 				logrus.Errorf("扫码成功但保存 cookies 失败，会话 #%d: %v", seq, err)
 				return

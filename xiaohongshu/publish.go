@@ -75,10 +75,6 @@ func NewPublishImageAction(page *rod.Page) (*PublishAction, error) {
 
 	pp := page.Timeout(300 * time.Second)
 
-	if err := ensureCreatorSession(pp); err != nil {
-		return nil, err
-	}
-
 	if err := pp.Navigate(urlOfPublic); err != nil {
 		return nil, errors.Wrap(err, "导航到发布页面失败")
 	}
@@ -92,6 +88,10 @@ func NewPublishImageAction(page *rod.Page) (*PublishAction, error) {
 		logrus.Warnf("等待 DOM 稳定出现问题: %v，继续尝试", err)
 	}
 	time.Sleep(1 * time.Second)
+
+	if err := waitPublishPageReady(pp); err != nil {
+		return nil, err
+	}
 
 	if err := mustClickPublishTab(pp, "上传图文"); err != nil {
 		logrus.Errorf("点击上传图文 TAB 失败: %v", err)
@@ -182,6 +182,29 @@ func clickEmptyPosition(page *rod.Page) {
 	if err := humanize.ClickAt(page, pt); err != nil {
 		logrus.Debugf("点击空位置失败: %v", err)
 	}
+}
+
+// waitPublishPageReady 等发布页渲染出上传区域，顺便识别登录页。
+// 登录态失效时 20s 内快速失败，避免 MustElement 一直卡到页面超时。
+func waitPublishPageReady(page *rod.Page) error {
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if info, err := page.Info(); err == nil && strings.Contains(info.URL, "/login") {
+			logCreatorPage(page)
+			return errors.New("创作者中心登录失效，请重新扫码登录")
+		}
+
+		has, el, err := page.Has("div.upload-content")
+		if err == nil && has && el != nil {
+			if visible, err := el.Visible(); err == nil && visible {
+				return nil
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	logCreatorPage(page)
+	return errors.New("创作者中心登录失效，请重新扫码登录")
 }
 
 func mustClickPublishTab(page *rod.Page, tabname string) error {
