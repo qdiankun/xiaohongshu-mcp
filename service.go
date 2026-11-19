@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -106,31 +107,34 @@ func (s *XiaohongshuService) DeleteCookies(ctx context.Context) error {
 
 // CheckLoginStatus 检查登录状态
 func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatusResponse, error) {
-	b := newBrowser()
-	defer b.Close()
+	var response *LoginStatusResponse
 
-	page := b.NewPage()
-	defer page.Close()
+	err := withSession(func(page *rod.Page) error {
+		loginAction := xiaohongshu.NewLogin(page)
 
-	loginAction := xiaohongshu.NewLogin(page)
+		isLoggedIn, err := loginAction.CheckLoginStatus(ctx)
+		if err != nil {
+			return err
+		}
 
-	isLoggedIn, err := loginAction.CheckLoginStatus(ctx)
+		response = &LoginStatusResponse{
+			IsLoggedIn: isLoggedIn,
+		}
+
+		// 已登录时从当前页读取真实账号信息；读不到只记 warn，不影响状态返回。
+		if isLoggedIn {
+			if user, err := loginAction.CurrentUser(ctx); err != nil {
+				logrus.Warnf("failed to get current user info: %v", err)
+			} else {
+				response.Username = user.Nickname
+				response.UserID = user.UserID
+			}
+		}
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	response := &LoginStatusResponse{
-		IsLoggedIn: isLoggedIn,
-	}
-
-	// 已登录时从当前页读取真实账号信息；读不到只记 warn，不影响状态返回。
-	if isLoggedIn {
-		if user, err := loginAction.CurrentUser(ctx); err != nil {
-			logrus.Warnf("failed to get current user info: %v", err)
-		} else {
-			response.Username = user.Nickname
-			response.UserID = user.UserID
-		}
 	}
 
 	return response, nil
@@ -285,18 +289,14 @@ func (s *XiaohongshuService) processImages(images []string) ([]string, error) {
 
 // publishContent 执行内容发布
 func (s *XiaohongshuService) publishContent(ctx context.Context, content xiaohongshu.PublishImageContent) error {
-	b := newBrowser()
-	defer b.Close()
+	return withSession(func(page *rod.Page) error {
+		action, err := xiaohongshu.NewPublishImageAction(page)
+		if err != nil {
+			return err
+		}
 
-	page := b.NewPage()
-	defer page.Close()
-
-	action, err := xiaohongshu.NewPublishImageAction(page)
-	if err != nil {
-		return err
-	}
-
-	return action.Publish(ctx, content)
+		return action.Publish(ctx, content)
+	})
 }
 
 // PublishVideo 发布视频（本地文件）
@@ -365,18 +365,14 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
 
 // publishVideo 执行视频发布
 func (s *XiaohongshuService) publishVideo(ctx context.Context, content xiaohongshu.PublishVideoContent) error {
-	b := newBrowser()
-	defer b.Close()
+	return withSession(func(page *rod.Page) error {
+		action, err := xiaohongshu.NewPublishVideoAction(page)
+		if err != nil {
+			return err
+		}
 
-	page := b.NewPage()
-	defer page.Close()
-
-	action, err := xiaohongshu.NewPublishVideoAction(page)
-	if err != nil {
-		return err
-	}
-
-	return action.PublishVideo(ctx, content)
+		return action.PublishVideo(ctx, content)
+	})
 }
 
 // ListFeeds 获取Feeds列表
@@ -638,6 +634,32 @@ func newBrowser() *headless_browser.Browser {
 	)
 }
 
+// browserMu 串行化浏览器会话。
+//
+// 每个工具调用原来都会各自 newBrowser()，也就是各自拉起一个 Chromium。
+// 同一个账号的 cookies 被多个实例同时使用时有三个副作用：
+//   - 登录态互相踢，发布请求可能被判为失效；
+//   - CPU/内存被抢，CDP 调用变慢，MustElement 直接撞满 ctx deadline 而 panic
+//     （日志里 get_my_profile 卡满 60s 就是这一类）；
+//   - 两个发布请求并发抢同一个账号，等于自己给自己风控。
+//
+// 单账号场景下排队执行是唯一稳妥的做法：宁可慢，也不要并发。
+var browserMu sync.Mutex
+
+// withSession 在独占的浏览器会话里执行 fn，退出会话才释放锁。
+func withSession(fn func(*rod.Page) error) error {
+	browserMu.Lock()
+	defer browserMu.Unlock()
+
+	b := newBrowser()
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	return fn(page)
+}
+
 func saveCookies(page *rod.Page) error {
 	cks, err := page.Browser().GetCookies()
 	if err != nil {
@@ -655,13 +677,7 @@ func saveCookies(page *rod.Page) error {
 
 // withBrowserPage 执行需要浏览器页面的操作的通用函数
 func withBrowserPage(fn func(*rod.Page) error) error {
-	b := newBrowser()
-	defer b.Close()
-
-	page := b.NewPage()
-	defer page.Close()
-
-	return fn(page)
+	return withSession(fn)
 }
 
 // GetMyProfile 获取当前登录用户的个人信息

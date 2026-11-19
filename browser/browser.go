@@ -70,7 +70,12 @@ func NewBrowser(headless bool, options ...Option) *headless_browser.Browser {
 		headless_browser.WithLanguage("zh-CN"), // 面向小红书
 		// 品牌报 Chrome。
 		// 注：hardware-concurrency 不设，交给 seed 派生。
-		headless_browser.WithExtraFlags(map[string]string{"fingerprint-brand": "Chrome"}),
+		// deny-permission-prompts：自动拒绝定位/通知等权限弹窗。GUI 模式下弹窗会遮挡页面并吞掉首次点击，
+		// 导致点击发布无反应；无头模式默认不弹，所以此问题只在 noVNC 环境暴露。
+		headless_browser.WithExtraFlags(map[string]string{
+			"fingerprint-brand":       "Chrome",
+			"deny-permission-prompts": "",
+		}),
 	}
 	opts = append(opts, headless_browser.WithChromeBinPath(binPath))
 

@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -16,6 +18,7 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"github.com/xpzouying/xiaohongshu-mcp/cookies"
 	"github.com/xpzouying/xiaohongshu-mcp/humanize"
 )
 
@@ -54,6 +57,14 @@ const (
 	mentionSearchAttempts = 3
 	// mentionIDSearchTimeout 用 user_id 搜索时等候选的窗口（实测约 1.5s 才出来）
 	mentionIDSearchTimeout = 4 * time.Second
+
+	// 图片虽已进入预览区，后台仍在处理，页面会挂着 uploading mask；
+	// 这个阶段点发布不会发出任何请求。实测 11 图约需 70 秒。
+	uploadingMaskTimeout      = 150 * time.Second
+	uploadingMaskPollInterval = 500 * time.Millisecond
+
+	// 点新版发布按钮后等确认浮层出现的窗口。
+	publishOverlayTimeout = 10 * time.Second
 )
 
 // mentionItemContainers @ 联想列表的候选容器，按先后顺序尝试。
@@ -302,13 +313,24 @@ func isElementBlocked(elem *rod.Element) (bool, error) {
 
 func uploadImages(page *rod.Page, imagesPaths []string) error {
 	validPaths := make([]string, 0, len(imagesPaths))
+	missing := make([]string, 0)
+
 	for _, path := range imagesPaths {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
+		if _, err := os.Stat(path); err != nil {
 			logrus.Warnf("图片文件不存在: %s", path)
+			missing = append(missing, path)
 			continue
 		}
 		validPaths = append(validPaths, path)
 		logrus.Infof("获取有效图片：%s", path)
+	}
+
+	// 路径不对必须立刻失败。原先这里只 warn 跳过，全部缺失时 validPaths 为空，
+	// 会带着 0 张图一路填标题正文、点到发布按钮，最后只换回一句
+	// "发布未确认成功"，真正的原因（路径写错）被埋在十几行 warn 里。
+	if len(missing) > 0 {
+		return errors.Errorf("有 %d 张图片文件不存在，已中止发布（首张缺失: %s），请检查图片路径",
+			len(missing), missing[0])
 	}
 
 	// 逐张上传：每张上传后等待预览出现，再上传下一张
@@ -420,6 +442,12 @@ func submitPublish(ctx context.Context, page *rod.Page, title, content string, t
 	}
 	slog.Info("检查标题长度：通过")
 
+	// 标题是 <input>，它的值不进 innerText，页面文案里永远看不到；而不小心写空时
+	// 小红书不报错、不跳转，只表现为"点了发布没反应"。这里直接把输入框的真实值读出来确认。
+	if err := verifyTitleFilled(titleElem); err != nil {
+		return err
+	}
+
 	humanize.Delay(ctx, humanize.AfterType)
 
 	contentElem, err := getContentElement(page, contentElemTimeout)
@@ -475,28 +503,140 @@ func submitPublish(ctx context.Context, page *rod.Page, title, content string, t
 		return errors.Wrap(err, "绑定商品失败")
 	}
 
+	// 图片虽然已出现在预览区，但后台仍在处理（页面上有多个 uploading mask）。
+	// 这个阶段点发布不会触发任何请求，必须等 mask 清零。
+	if err := waitUploadingMasksClear(page, uploadingMaskTimeout); err != nil {
+		return err
+	}
+
 	if err := clickPublishButton(page); err != nil {
 		return err
 	}
 
 	// 校验发布真的成功：成功后创作平台会跳转离开发布页；未跳转则判定失败，
 	// 消除"点了发布按钮就算成功"的假阳性。
-	return waitPublishSuccess(page, 15*time.Second)
+	return waitPublishSuccess(page, 30*time.Second)
 }
 
-// waitPublishSuccess 轮询等待发布成功的信号：小红书发布成功后会跳转离开发布表单页
-// （URL 不再含 /publish/publish）。超时仍未跳转 → 判定发布失败。
+// publishSuccessTexts 原地发布成功时页面会出现的提示文案（部分版本只 toast 不跳转）。
+var publishSuccessTexts = []string{"发布成功", "笔记已发布", "已发布"}
+
+// toastSelectors 页面提示（toast / 校验错误 / 风控拦截）常见的承载节点。
+// 只用于诊断与结果判定，取不到就继续，不影响主流程。
+var toastSelectors = []string{
+	".d-toast",
+	".toast",
+	"[class*='toast']",
+	"[class*='Toast']",
+	".d-message",
+	"[class*='error-msg']",
+	"[class*='errorTips']",
+}
+
+// readPageToast 读当前可见提示文案，没有则返回空串。
+func readPageToast(page *rod.Page) string {
+	for _, sel := range toastSelectors {
+		elems, err := page.Elements(sel)
+		if err != nil {
+			continue
+		}
+		for _, elem := range elems {
+			if visible, err := elem.Visible(); err != nil || !visible {
+				continue
+			}
+			text, err := elem.Text()
+			if err != nil {
+				continue
+			}
+			if text = strings.TrimSpace(text); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+// waitPublishSuccess 轮询等待发布成功的信号：
+//  1. 跳转离开发布表单页（URL 不再含 /publish/publish）——最强信号；
+//  2. 出现"发布成功"类 toast——有的版本只在原地提示。
+//
+// 等待期间每 300ms 抓一次页面提示。此前只在超时后抓页面，toast 早已消失，
+// 现场看起来"页面干干净净"，无从判断是校验没过、风控拦截还是点击没生效。
 func waitPublishSuccess(page *rod.Page, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	var hints []string
+
 	for {
-		if info, err := page.Info(); err == nil && !strings.Contains(info.URL, "/publish/publish") {
+		info, infoErr := page.Info()
+		if infoErr == nil && !strings.Contains(info.URL, "/publish/publish") {
 			slog.Info("发布成功，已跳转离开发布页", "url", info.URL)
 			return nil
 		}
+
+		if msg := readPageToast(page); msg != "" && !containsString(hints, msg) {
+			hints = append(hints, msg)
+			slog.Warn("发布过程中页面提示", "text", msg)
+			for _, ok := range publishSuccessTexts {
+				if strings.Contains(msg, ok) {
+					slog.Info("发布成功，页面提示确认", "text", msg)
+					return nil
+				}
+			}
+		}
+
 		if time.Now().After(deadline) {
+			capturePublishFailure(page, hints)
+			if len(hints) > 0 {
+				return errors.Errorf("发布未确认成功：点击发布后未跳转离开发布页，页面提示: %s",
+					strings.Join(hints, " | "))
+			}
 			return errors.New("发布未确认成功：点击发布后未跳转离开发布页（可能校验未过或被拦截）")
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+func containsString(list []string, s string) bool {
+	for _, item := range list {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+// capturePublishFailure 发布失败时留存现场：截图 + URL + 页面文案 + 过程提示。
+// 纯诊断，不阻断报错返回；写盘失败只记 warn，避免掩盖真正的发布错误。
+func capturePublishFailure(page *rod.Page, hints []string) {
+	// 与 cookies 同目录（如 /app/data），保证在挂载卷内、可写。
+	dir := filepath.Dir(cookies.GetCookiesFilePath())
+
+	if info, err := page.Info(); err == nil {
+		slog.Error("发布失败现场", "url", info.URL)
+	}
+	if len(hints) > 0 {
+		slog.Error("发布失败过程提示", "text", strings.Join(hints, " | "))
+	}
+
+	shotPath := filepath.Join(dir, "last-publish-fail.png")
+	if shot, err := page.Screenshot(true, nil); err != nil {
+		slog.Warn("截图发布失败现场失败", "error", err)
+	} else if err := os.WriteFile(shotPath, shot, 0o644); err != nil {
+		slog.Warn("保存发布失败截图失败", "error", err)
+	} else {
+		slog.Info("发布失败截图已保存", "path", shotPath)
+	}
+
+	// 抓可见文案片段，帮助判断是否有 toast/校验提示/风控弹窗。
+	if body, err := page.Element("body"); err == nil {
+		if text, err := body.Text(); err == nil {
+			const maxLen = 500
+			runes := []rune(text)
+			if len(runes) > maxLen {
+				text = string(runes[:maxLen]) + "..."
+			}
+			slog.Error("发布失败页面文案", "text", text)
+		}
 	}
 }
 
@@ -505,18 +645,182 @@ type publishButton struct {
 	isWidget bool
 }
 
+// jsCountUploadingMasks 统计当前可见的 uploading mask，返回 "数量|样例类名"。
+// 预览区出现图片 ≠ 图片处理完成；mask 未清零时点发布不会发出任何请求。
+const jsCountUploadingMasks = `() => {
+  const nodes = document.querySelectorAll('[class*="uploading"], [class*="loading"], [class*="spinner"], [aria-busy="true"]');
+  let count = 0, sample = '';
+  for (const el of nodes) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) continue;
+    const s = getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') continue;
+    const cls = String(el.className || '');
+    const busyText = /上传中|处理中|正在上传/.test(el.textContent || '');
+    if (!/uploading|loading|spinner/i.test(cls) && !busyText && el.getAttribute('aria-busy') !== 'true') continue;
+    count++;
+    if (!sample) sample = cls.slice(0, 80) || (busyText ? '上传中' : 'aria-busy');
+  }
+  return String(count) + '|' + sample;
+}`
+
+// waitUploadingMasksClear 等图片处理遮罩全部消失。
+func waitUploadingMasksClear(page *rod.Page, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	lastCount := -1
+
+	for {
+		count, sample := 0, ""
+		if res, err := page.Eval(jsCountUploadingMasks); err == nil && res != nil {
+			parts := strings.SplitN(res.Value.Str(), "|", 2)
+			if n, err := strconv.Atoi(parts[0]); err == nil {
+				count = n
+			}
+			if len(parts) > 1 {
+				sample = parts[1]
+			}
+		}
+
+		if count == 0 {
+			slog.Info("图片处理完成，上传遮罩已清零")
+			return nil
+		}
+		if count != lastCount {
+			slog.Info("等待图片处理完成", "masks", count, "sample", sample)
+			lastCount = count
+		}
+		if time.Now().After(deadline) {
+			capturePublishFailure(page, nil)
+			return errors.Errorf("图片处理未完成：仍有 %d 个 uploading mask（样例: %s），已等待 %s",
+				count, sample, timeout)
+		}
+		time.Sleep(uploadingMaskPollInterval)
+	}
+}
+
+// jsClickPublishOverlay 找到并点击确认浮层里的真「发布」按钮。
+// 返回 "标签|文案|类名"，没有浮层返回空串。
+const jsClickPublishOverlay = `() => {
+  const visible = el => {
+    if (!el || el.nodeType !== 1) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const s = getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  };
+  const all = Array.from(document.querySelectorAll('div, span, button, a, [role="button"]'));
+  const text = el => (el.textContent || '').trim();
+  const discard = all.some(el => visible(el) && text(el) === '暂存离开');
+  const labels = ['发布', '确认发布', '立即发布'];
+  const candidates = all.filter(el => visible(el) && labels.includes(text(el)));
+  if (!candidates.length) return '';
+  const inModal = el => !!el.closest('[class*="modal"], [class*="dialog"], [class*="pop"], [role="dialog"], [class*="overlay"]');
+  const target = candidates.find(inModal) || (discard ? candidates[0] : null);
+  if (!target) return '';
+  const clickable = target.closest('button, [role="button"], .btn-inner') || target;
+  clickable.click();
+  return clickable.tagName + '|' + text(target) + '|' + String(clickable.className || '').slice(0, 80);
+}`
+
+// jsClickPublishWidget 用 JS 点击新版 xhs-publish-btn。
+// 它是 closed shadow DOM 自定义元素，按坐标点经常落空甚至点到侧边栏。
+// inner=true 时改点它内部的 .btn-inner / .btn-text，作为宿主点击无效的兜底。
+const jsClickPublishWidget = `(inner) => {
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const s = getComputedStyle(el);
+    return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  };
+  const widgets = Array.from(document.querySelectorAll('xhs-publish-btn')).filter(visible);
+  const target = widgets.find(el => (el.textContent || '').includes('发布')) || widgets[0];
+  if (!target) return '';
+  const clickTarget = inner
+    ? (target.querySelector('.btn-inner, .btn-text, button, [role="button"]') || target)
+    : target;
+  clickTarget.click();
+  return clickTarget.tagName + '|' + (clickTarget.textContent || '').trim().slice(0, 40);
+}`
+
+// waitPublishSubmitted 点击后等提交信号：URL 已跳转，或确认浮层里的发布已被点掉。
+func waitPublishSubmitted(page *rod.Page, timeout time.Duration) (bool, error) {
+	deadline := time.Now().Add(timeout)
+
+	for {
+		if info, err := page.Info(); err == nil && !strings.Contains(info.URL, "/publish/publish") {
+			return true, nil
+		}
+
+		res, err := page.Eval(jsClickPublishOverlay)
+		if err == nil && res != nil {
+			if clicked := res.Value.Str(); clicked != "" {
+				slog.Info("已点击确认浮层里的发布按钮", "target", clicked)
+				return true, nil
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 func clickPublishButton(page *rod.Page) error {
 	btn, err := waitForPublishButtonClickable(page, 15*time.Second)
 	if err != nil {
 		return err
 	}
 
-	if btn.isWidget {
-		return clickPublishWidget(page, btn.elem)
+	// 点击前先看有没有浮层压着按钮：被遮挡时点击会被 GUI 层吞掉，
+	// 页面不会有任何反应，最终只表现为"点了发布但不跳转"。
+	if blocked, err := isElementBlocked(btn.elem); err == nil && blocked {
+		slog.Warn("发布按钮被其他元素遮挡，尝试关闭浮层后重试")
+		dismissPopCover(page)
+		time.Sleep(300 * time.Millisecond)
 	}
 
-	if err := humanize.Click(btn.elem); err != nil {
-		return errors.Wrap(err, "点击发布按钮失败")
+	submitted := false
+	if btn.isWidget {
+		// 新版按钮：先 JS 点宿主，再 JS 点内部节点，最后才回退坐标点击。
+		for _, inner := range []bool{false, true} {
+			res, err := page.Eval(jsClickPublishWidget, inner)
+			if err != nil {
+				slog.Warn("JS 点击新版发布按钮失败", "inner", inner, "error", err)
+				continue
+			}
+			if res != nil && res.Value.Str() != "" {
+				slog.Info("JS 点击新版发布按钮", "inner", inner, "target", res.Value.Str())
+			}
+			submitted, err = waitPublishSubmitted(page, 4*time.Second)
+			if err != nil {
+				return err
+			}
+			if submitted {
+				break
+			}
+		}
+		if !submitted {
+			if err := clickPublishWidget(page, btn.elem); err != nil {
+				return err
+			}
+			submitted, err = waitPublishSubmitted(page, 6*time.Second)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		if err := humanize.Click(btn.elem); err != nil {
+			return errors.Wrap(err, "点击发布按钮失败")
+		}
+		submitted, err = waitPublishSubmitted(page, 6*time.Second)
+		if err != nil {
+			return err
+		}
+	}
+
+	if !submitted {
+		slog.Warn("点击发布后既未跳转也未发现确认浮层，继续等待跳转以确认结果")
 	}
 	return nil
 }
@@ -691,6 +995,29 @@ func tryRefocusTitle(page *rod.Page) {
 		return
 	}
 	slog.Info("已回点标题输入框，继续后续发布流程")
+}
+
+// verifyTitleFilled 确认标题输入框里真的有字。
+// 标题是 <input>，其 value 不进 innerText，页面文案（含失败现场抓取）永远看不到；
+// 而标题为空时小红书不报错、不跳转，只表现为"点了发布没反应"。
+func verifyTitleFilled(titleElem *rod.Element) error {
+	value, err := titleElem.Property("value")
+	if err != nil {
+		slog.Warn("读取标题输入框的值失败，跳过校验", "err", err)
+		return nil
+	}
+
+	title := strings.TrimSpace(value.String())
+	if title == "" {
+		return errors.New("标题输入框为空：标题未成功写入，小红书会静默忽略发布")
+	}
+
+	preview := []rune(title)
+	if len(preview) > 8 {
+		preview = preview[:8]
+	}
+	slog.Info("标题已写入", "len", utf8.RuneCountInString(title), "preview", string(preview))
+	return nil
 }
 
 // 检查标题是否超过最大长度
