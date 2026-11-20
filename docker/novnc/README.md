@@ -28,7 +28,7 @@ docker compose up -d
 
 **3. 连接使用**
 
-- 桌面：[点击打开](http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale)。
+- 桌面：[点击打开](http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale)。首次打开会弹出账号密码框，密码见下方说明。
 - MCP：`http://127.0.0.1:18060/mcp`，按 [客户端配置](../../README.md#2-mcp-客户端接入) 接入 AI。
 
 桌面空白时，让 AI“获取小红书登录二维码”即可出现浏览器。普通工具调用结束后窗口通常关闭，人工操作时避免与自动化同时输入或点击。
@@ -39,7 +39,14 @@ docker compose up -d
 - 发布素材：文件放入 `docker/novnc/images/`，告诉 AI 容器内路径，例如 `/app/images/cover.jpg`。桌面文件窗口的 **images** 书签也可找到，素材挂载为只读。
 - 更新：在 `docker/novnc/` 执行 `docker compose pull`，再执行 `docker compose up -d`。
 
-**桌面没有密码，仅限本机或 SSH 转发访问，不要直接暴露公网。** `AUTH_TOKEN` 只保护 MCP API。
+**桌面有 Basic Auth 保护，但走明文 HTTP。** 请勿在不可信网络长期使用——密码可能在网络中被截获。公网部署应再套一层 HTTPS（见下方说明）。`AUTH_TOKEN` 只保护 MCP API，与桌面密码是两套独立凭证。
+
+桌面账号密码获取方式：
+
+1. 在 `.env` 里设置 `XHS_VNC_USER` 和 `XHS_VNC_PASSWORD`，重启后即用这对凭证；
+2. 不设密码时，首次启动自动生成 16 位随机密码，打印在 `docker logs` 里（搜索 `VNC 密码`），并写入数据目录的 `vnc_password.txt`，后续重启沿用同一密码。
+
+公网 HTTPS 建议：用腾讯云免费 DV 证书 + 宿主机上的 nginx/Caddy 做 TLS 终止，把 443 反代到本机 6080；云安全组只放行 443，6080 不要直接对外。
 
 <details>
 <summary>其他配置、数据迁移与远程访问</summary>
@@ -53,10 +60,14 @@ docker compose up -d
 | `XHS_MEDIA_DIR` | 素材目录，例如 `D:/images` 或 `/home/user/images` | `./images` |
 | `XHS_NOVNC_PORT` | 桌面端口 | `6080` |
 | `XHS_MCP_PORT` | MCP 端口 | `18060` |
+| `XHS_VNC_BIND` | 桌面监听地址；公网访问设为 `0.0.0.0`，仅本机用 `127.0.0.1` | `0.0.0.0` |
+| `XHS_VNC_USER` | 桌面 Basic Auth 用户名 | `vnc` |
+| `XHS_VNC_PASSWORD` | 桌面 Basic Auth 密码；留空则自动生成随机密码 | 空（自动生成） |
+| `XHS_VNC_URL` | 供 `get_captcha_image` 返回给调用方的桌面地址，如 `http://公网IP:6080/vnc.html` | 空 |
 
 默认目录位于 `docker/novnc/` 下。从已有部署切换时，先停止旧实例，将 `XHS_DATA_DIR` 设为原 `data` 的完整路径，保留登录状态；不要同时运行两套实例操作同一账号。修改端口后，访问地址也要相应修改。
 
-远程访问示例：`ssh -L 6080:127.0.0.1:6080 user@server`，然后打开本机桌面地址。转发端口应与 `XHS_NOVNC_PORT` 一致；不一致时，在服务端配置 `NOVNC_ALLOWED_ORIGINS` 为浏览器实际使用的本机来源，例如 `http://127.0.0.1:16081`。不要将容器加入不可信的 Docker 网络。
+公网访问（已加 Basic Auth，但仍建议再套 HTTPS）：在腾讯云安全组放行 `XHS_NOVNC_PORT`，`.env` 里设置 `XHS_VNC_BIND=0.0.0.0`、`XHS_VNC_PASSWORD=你的密码`、`XHS_VNC_URL=http://公网IP:6080/vnc.html`，然后重启。不要在不可信的 Docker 网络里运行该容器。
 
 </details>
 

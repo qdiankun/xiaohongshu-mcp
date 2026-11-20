@@ -7,9 +7,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dbus-x11 xsettingsd \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 COPY start.sh /usr/local/bin/xhs-novnc-start
+COPY vnc_auth_proxy.py /usr/local/bin/vnc-auth-proxy
 COPY fcitx5-profile /usr/local/share/xhs-fcitx5-profile
 COPY rime-default.custom.yaml /usr/local/share/xhs-rime-default.custom.yaml
-RUN chmod 755 /usr/local/bin/xhs-novnc-start
+RUN chmod 755 /usr/local/bin/xhs-novnc-start /usr/local/bin/vnc-auth-proxy
 ENV DISPLAY=:99 LANG=C.UTF-8 \
     XMODIFIERS=@im=fcitx GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx
 EXPOSE 6080

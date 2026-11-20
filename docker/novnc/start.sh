@@ -69,10 +69,12 @@ pids+=("$!")
 # VNC 仅在容器回环监听；Caps Lock 状态参与键码转换。
 x11vnc -display "$DISPLAY" -rfbport 5900 -localhost -forever -shared -nopw -capslock &
 pids+=("$!")
-# 仅允许配置好的网页来源连接桌面，阻止其他网站跨站控制本机桌面。
-novnc_port="${NOVNC_PORT:-6080}"
-origins="${NOVNC_ALLOWED_ORIGINS:-http://127.0.0.1:$novnc_port http://localhost:$novnc_port http://[::1]:$novnc_port}"
-websockify --web /usr/share/novnc --auth-plugin ExpectOrigin --auth-source "$origins" 6080 localhost:5900 &
+# websockify 退到容器内部 6081，只接受来自本机 Basic Auth 代理的流量，
+# 不再对外暴露，因此原先防跨站的 ExpectOrigin 检查可以去掉（改由代理统一鉴权）。
+websockify --web /usr/share/novnc 6081 localhost:5900 &
+pids+=("$!")
+# Basic Auth 反代对外监听 6080，认证通过后透传到上面的 6081。
+python3 /usr/local/bin/vnc-auth-proxy &
 pids+=("$!")
 "$@" &
 app_pid=$!
