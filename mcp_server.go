@@ -556,13 +556,29 @@ func registerTools(server *mcp.Server, appServer *AppServer) {
 				DestructiveHint: boolPtr(true),
 			},
 		},
-		withPanicRecovery("like_notification", func(ctx context.Context, req *mcp.CallToolRequest, args LikeNotificationArgs) (*mcp.CallToolResult, any, error) {
-			result := appServer.handleLikeNotification(ctx, args.CommentID, args.Unlike)
+	withPanicRecovery("like_notification", func(ctx context.Context, req *mcp.CallToolRequest, args LikeNotificationArgs) (*mcp.CallToolResult, any, error) {
+		result := appServer.handleLikeNotification(ctx, args.CommentID, args.Unlike)
+		return convertToMCPResult(result), nil, nil
+	}),
+	)
+
+	// 工具 19: 获取验证码截图
+	mcp.AddTool(server,
+		&mcp.Tool{
+			Name:        "get_captcha_image",
+			Description: "获取最近一次发布时检测到的验证码截图（PNG）和元数据（标题、检测时间、VNC 地址）。发布工具报验证码相关错误时调用，把图片转发给用户，让用户在 VNC 里完成验证后重试发布。没有待处理验证码时只返回文字说明。",
+			Annotations: &mcp.ToolAnnotations{
+				Title:        "Get Captcha Image",
+				ReadOnlyHint: true,
+			},
+		},
+		withPanicRecovery("get_captcha_image", func(ctx context.Context, req *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
+			result := appServer.handleGetCaptchaImage(ctx)
 			return convertToMCPResult(result), nil, nil
 		}),
 	)
 
-	logrus.Infof("Registered %d MCP tools", 18)
+	logrus.Infof("Registered %d MCP tools", 19)
 }
 
 // convertToMCPResult 将自定义的 MCPToolResult 转换为官方 SDK 的格式

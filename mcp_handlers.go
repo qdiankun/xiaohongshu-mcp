@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/xpzouying/xiaohongshu-mcp/configs"
 	"github.com/xpzouying/xiaohongshu-mcp/cookies"
 	"github.com/xpzouying/xiaohongshu-mcp/xiaohongshu"
 )
@@ -844,4 +845,39 @@ func (s *AppServer) handleLikeNotification(ctx context.Context, commentID string
 	}
 
 	return marshalMCPResult(result, "点赞")
+}
+
+// handleGetCaptchaImage 取最近一次发布时捕获的验证码截图。
+// 供 MCP 调用方（如 octop）在发布报"需要人工验证"时拉取，转发给用户去 VNC 完成验证。
+func (s *AppServer) handleGetCaptchaImage(ctx context.Context) *MCPToolResult {
+	logrus.Info("MCP: 获取验证码截图")
+
+	snapshot, err := xiaohongshu.LoadCaptchaSnapshot()
+	if err != nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "读取验证码截图失败: " + err.Error()}},
+			IsError: true,
+		}
+	}
+	if snapshot == nil {
+		return &MCPToolResult{
+			Content: []MCPContent{{Type: "text", Text: "当前没有待处理的验证码截图。只有发布过程中检测到验证码时才会生成。"}},
+		}
+	}
+
+	vncURL := configs.VNCURL()
+	text := fmt.Sprintf("检测到验证码，请人工完成验证后重试发布。\n标题: %s\n检测时间: %s\n原因: %s\n截图路径(容器内): %s",
+		snapshot.Title, snapshot.DetectedAt, snapshot.Reason, snapshot.ImagePath)
+	if vncURL != "" {
+		text += "\nVNC 地址: " + vncURL
+	} else {
+		text += "\nVNC 地址: 未配置（设置环境变量 XHS_VNC_URL）"
+	}
+
+	return &MCPToolResult{
+		Content: []MCPContent{
+			{Type: "text", Text: text},
+			{Type: "image", MimeType: "image/png", Data: snapshot.ImageBase64},
+		},
+	}
 }

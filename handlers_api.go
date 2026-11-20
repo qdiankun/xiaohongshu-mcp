@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/xpzouying/xiaohongshu-mcp/configs"
 	"github.com/xpzouying/xiaohongshu-mcp/cookies"
 	"github.com/xpzouying/xiaohongshu-mcp/xiaohongshu"
 
@@ -410,4 +411,36 @@ func (s *AppServer) likeNotificationHandler(c *gin.Context) {
 	}
 
 	respondSuccess(c, map[string]any{"data": result}, "操作成功")
+}
+
+// getCaptchaHandler 返回最近一次发布时捕获的验证码截图（base64 PNG）和元数据。
+// 与 MCP 工具 get_captcha_image 同源，方便非 MCP 调用方取图。
+func (s *AppServer) getCaptchaHandler(c *gin.Context) {
+	snapshot, err := xiaohongshu.LoadCaptchaSnapshot()
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "CAPTCHA_READ_FAILED", "读取验证码截图失败", err.Error())
+		return
+	}
+	if snapshot == nil {
+		c.JSON(http.StatusOK, SuccessResponse{
+			Success: true,
+			Data:    map[string]any{"has_captcha": false},
+			Message: "当前没有待处理的验证码截图",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, SuccessResponse{
+		Success: true,
+		Data: map[string]any{
+			"has_captcha": true,
+			"title":       snapshot.Title,
+			"detected_at": snapshot.DetectedAt,
+			"reason":      snapshot.Reason,
+			"image_path":  snapshot.ImagePath,
+			"vnc_url":     configs.VNCURL(),
+			"image_base64": snapshot.ImageBase64,
+			"mime_type":   "image/png",
+		},
+	})
 }

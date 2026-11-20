@@ -65,6 +65,10 @@ const (
 
 	// 点新版发布按钮后等确认浮层出现的窗口。
 	publishOverlayTimeout = 10 * time.Second
+
+	// 检测到验证码后，留给人工在 VNC 完成验证的窗口。期间发布流程暂停等待，
+	// 用户验证通过后页面会继续跳转，程序自动判定成功；超时才报错并提示取图。
+	captchaWaitTimeout = 120 * time.Second
 )
 
 // mentionItemContainers @ 联想列表的候选容器，按先后顺序尝试。
@@ -120,6 +124,9 @@ func (p *PublishAction) Publish(ctx context.Context, content PublishImageContent
 	if len(content.ImagePaths) == 0 {
 		return errors.New("图片不能为空")
 	}
+
+	// 新一次发布开始前清掉上次的验证码快照，避免调用方取到过期图片。
+	ClearCaptchaSnapshot()
 
 	// 重设超时：.Context(ctx) 会替换掉 NewPublishImageAction 里 Timeout(300s) 的 deadline
 	page := p.page.Context(ctx).Timeout(300 * time.Second)
@@ -515,7 +522,8 @@ func submitPublish(ctx context.Context, page *rod.Page, title, content string, t
 
 	// 校验发布真的成功：成功后创作平台会跳转离开发布页；未跳转则判定失败，
 	// 消除"点了发布按钮就算成功"的假阳性。
-	return waitPublishSuccess(page, 30*time.Second)
+	// 期间若出现验证码，会落盘截图并延长等待，给人工在 VNC 完成验证的时间。
+	return waitPublishSuccess(page, 30*time.Second, title)
 }
 
 // publishSuccessTexts 原地发布成功时页面会出现的提示文案（部分版本只 toast 不跳转）。
@@ -558,18 +566,21 @@ func readPageToast(page *rod.Page) string {
 
 // waitPublishSuccess 轮询等待发布成功的信号：
 //  1. 跳转离开发布表单页（URL 不再含 /publish/publish）——最强信号；
-//  2. 出现"发布成功"类 toast——有的版本只在原地提示。
+//  2. 出现"发布成功"类 toast——有的版本只在原地提示；
+//  3. 若出现验证码：落盘截图，延长 captchaWaitTimeout 等待人工在 VNC 完成验证。
 //
 // 等待期间每 300ms 抓一次页面提示。此前只在超时后抓页面，toast 早已消失，
 // 现场看起来"页面干干净净"，无从判断是校验没过、风控拦截还是点击没生效。
-func waitPublishSuccess(page *rod.Page, timeout time.Duration) error {
+func waitPublishSuccess(page *rod.Page, timeout time.Duration, title string) error {
 	deadline := time.Now().Add(timeout)
+	captchaDeadline := time.Time{}
 	var hints []string
 
 	for {
 		info, infoErr := page.Info()
 		if infoErr == nil && !strings.Contains(info.URL, "/publish/publish") {
 			slog.Info("发布成功，已跳转离开发布页", "url", info.URL)
+			ClearCaptchaSnapshot()
 			return nil
 		}
 
@@ -579,8 +590,28 @@ func waitPublishSuccess(page *rod.Page, timeout time.Duration) error {
 			for _, ok := range publishSuccessTexts {
 				if strings.Contains(msg, ok) {
 					slog.Info("发布成功，页面提示确认", "text", msg)
+					ClearCaptchaSnapshot()
 					return nil
 				}
+			}
+		}
+
+		if reason := DetectCaptcha(page); reason != "" {
+			if captchaDeadline.IsZero() {
+				// 第一次发现：立即保存现场，并把等待窗口延长给人工验证。
+				if err := SaveCaptchaSnapshot(page, title, reason); err != nil {
+					slog.Warn("保存验证码现场失败", "error", err)
+				} else {
+					slog.Warn("检测到验证码，截图已保存，可调用 get_captcha_image 取图", "reason", reason)
+				}
+				captchaDeadline = time.Now().Add(captchaWaitTimeout)
+				if captchaDeadline.After(deadline) {
+					deadline = captchaDeadline
+				}
+			} else if time.Now().After(captchaDeadline) {
+				capturePublishFailure(page, hints)
+				return errors.Errorf("发布被验证码拦截，已等待 %s 仍未通过人工验证；调用 get_captcha_image 获取截图，在 VNC 完成验证后重试发布（原因: %s）",
+					captchaWaitTimeout, reason)
 			}
 		}
 

@@ -16,6 +16,8 @@ services:
       XHS_PROXY: ${XHS_PROXY:-}
       NOVNC_PORT: ${XHS_NOVNC_PORT:-6080}
       NOVNC_ALLOWED_ORIGINS: ${NOVNC_ALLOWED_ORIGINS:-}
+      # 供 get_captcha_image 返回给调用方，用户验证时打开的 VNC 地址
+      XHS_VNC_URL: ${XHS_VNC_URL:-}
     volumes:
       - ${XHS_DATA_DIR:-./data}:/app/data
       - ${XHS_MEDIA_DIR:-./images}:/app/images:ro

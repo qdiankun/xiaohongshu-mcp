@@ -168,5 +168,5 @@ func submitPublishVideo(ctx context.Context, page *rod.Page, title, content stri
 	}
 
 	// 校验发布真的成功（成功跳转离开发布页），未跳转判失败——消除假成功
-	return waitPublishSuccess(page, 15*time.Second)
+	return waitPublishSuccess(page, 15*time.Second, title)
 }
